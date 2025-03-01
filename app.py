@@ -25,6 +25,7 @@ VIDEO_EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv']
 # 全局变量
 SOURCE_DIR = ""
 TARGET_DIR = ""
+CACHE_DIR = ""
 DB_PATH = ""
 
 # 统计信息全局变量
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 def load_config():
     """从配置文件加载配置，支持不同环境(dev/prod)"""
-    global SOURCE_DIR, TARGET_DIR, DB_PATH
+    global SOURCE_DIR, TARGET_DIR, CACHE_DIR, DB_PATH
 
     try:
         # 获取应用根目录
@@ -68,16 +69,17 @@ def load_config():
         # 从环境配置中获取目录设置
         SOURCE_DIR = env_config.get('paths', {}).get('source_dir')
         TARGET_DIR = env_config.get('paths', {}).get('target_dir')
+        CACHE_DIR = env_config.get('paths', {}).get('cache_dir')
 
-        if not SOURCE_DIR or not TARGET_DIR:
-            raise ValueError("配置文件中缺少必要的路径配置(source_dir 或 target_dir)")
+        if not SOURCE_DIR or not TARGET_DIR or not CACHE_DIR:
+            raise ValueError("配置文件中缺少必要的路径配置(source_dir 或 target_dir 或 cache_dir)")
 
         # 创建.cache目录并将数据库文件存储在其中
-        cache_dir = os.path.join(os.path.dirname(TARGET_DIR), ".cache")
+        cache_dir = CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
         DB_PATH = os.path.join(cache_dir, ".video_srt_index")
 
-        logger.info(f"配置加载成功: SOURCE_DIR={SOURCE_DIR}, TARGET_DIR={TARGET_DIR}")
+        logger.info(f"配置加载成功: SOURCE_DIR={SOURCE_DIR}, TARGET_DIR={TARGET_DIR}, CACHE_DIR={CACHE_DIR}")
         logger.info(f"数据库文件位置: {DB_PATH}")
     except Exception as e:
         logger.error(f"加载配置文件失败: {e}")
