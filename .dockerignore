@@ -1,0 +1,14 @@
+# 排除output目录
+output/
+# 排除其他不需要的文件/目录
+.git/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.venv
+env/
+venv/

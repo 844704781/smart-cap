@@ -309,7 +309,7 @@ def get_target_paths(video_path: str) -> Dict[str, str]:
     
     # 构建音频和SRT文件路径
     audio_path = os.path.join(target_subdir, f"{file_base}.mp3")
-    srt_path = os.path.join(target_subdir, f"{file_base}.srt")
+    srt_path = os.path.join(target_subdir, f"{file_base}.txt")
     
     return {
         "audio_path": audio_path,
