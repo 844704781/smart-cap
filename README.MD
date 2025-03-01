@@ -84,6 +84,65 @@
      Get-Content -Path "path\to\cache\logs\smart_cap.log" -Tail 10 -Wait -Encoding utf8
      ```
 
+## Docker部署
+
+### 构建Docker镜像
+
+1. 确保您已安装Docker
+
+2. 在项目根目录下构建Docker镜像
+   ```bash
+   docker build -t smart-cap .
+   ```
+
+### 使用Docker运行
+
+1. 创建适当的配置文件，修改source_dir和target_dir路径为容器内路径
+
+2. 使用以下命令运行容器，挂载视频源目录和字幕输出目录
+   ```bash
+   docker run -d \
+     --name smart-cap \
+     -v /本地源视频目录:/容器内源视频目录 \
+     -v /本地字幕输出目录:/容器内字幕输出目录 \
+     smart-cap
+   ```
+
+   例如:
+   ```bash
+   docker run -d \
+     --name smart-cap \
+     -v /home/user/videos:/app/videos \
+     -v /home/user/subtitles:/app/subtitles \
+     smart-cap
+   ```
+
+3. 查看容器日志
+   ```bash
+   docker logs -f smart-cap
+   ```
+
+### Docker Compose部署
+
+也可以使用Docker Compose来简化部署:
+
+1. 创建`docker-compose.yml`文件:
+   ```yaml
+   version: '3'
+   services:
+     smart-cap:
+       build: .
+       volumes:
+         - /本地源视频目录:/容器内源视频目录
+         - /本地字幕输出目录:/容器内字幕输出目录
+       restart: unless-stopped
+   ```
+
+2. 启动服务
+   ```bash
+   docker-compose up -d
+   ```
+
 ## 日志和临时文件
 
 - 程序生成的所有日志文件存储在 `[TARGET_DIR上级目录]/.cache/logs/` 目录中
