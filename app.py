@@ -3,7 +3,8 @@ import logging
 import os
 import shelve
 import time
-from logging.handlers import RotatingFileHandler
+import traceback
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from typing import Dict, Optional, List
 
 import yaml
@@ -16,8 +17,19 @@ from contextlib import redirect_stdout, redirect_stderr
 from proglog import TqdmProgressBarLogger, ProgressBarLogger
 import re
 import threading
+import signal
 
 from srt.ksasr import KuaiShouASR
+
+
+# 添加超时处理
+class TimeoutError(Exception):
+    pass
+
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("操作超时")
+
 
 # 视频文件扩展名
 VIDEO_EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv']
@@ -32,6 +44,7 @@ DB_PATH = ""
 total_videos_found = 0
 total_videos_processed = 0
 total_videos_skipped = 0
+total_videos_failed = 0
 new_videos_detected = 0
 pending_videos = 0
 
@@ -65,7 +78,7 @@ def load_config():
 
         with open(env_config_path, 'r', encoding='utf-8') as f:
             env_config = yaml.safe_load(f)
-        
+
         # 从环境配置中获取目录设置
         SOURCE_DIR = env_config.get('paths', {}).get('source_dir')
         TARGET_DIR = env_config.get('paths', {}).get('target_dir')
@@ -82,7 +95,7 @@ def load_config():
         logger.info(f"配置加载成功: SOURCE_DIR={SOURCE_DIR}, TARGET_DIR={TARGET_DIR}, CACHE_DIR={CACHE_DIR}")
         logger.info(f"数据库文件位置: {DB_PATH}")
     except Exception as e:
-        logger.error(f"加载配置文件失败: {e}")
+        logger.error(f"加载配置文件失败: {e}", exc_info=True)
         raise
 
 
@@ -103,7 +116,7 @@ class MoviePyProgressLogger(ProgressBarLogger):
         # 仅用于内部跟踪
         self._last_percent = -1
         self.operation_name = "音频提取"
-        
+
     def set_operation_name(self, name):
         """设置当前操作名称"""
         self.operation_name = name
@@ -121,32 +134,32 @@ class MoviePyProgressLogger(ProgressBarLogger):
                 self.t_total = value
             elif attr == 'index':
                 self.t_index = value
-                
+
         # 计算总体进度百分比
         chunk_progress = self.chunk_index / self.chunk_total if self.chunk_total > 0 else 0
         t_progress = self.t_index / self.t_total if self.t_total > 0 else 0
-        
+
         if self.t_total > 1 and self.chunk_total > 1:
             progress = (chunk_progress + t_progress) / 2
         elif self.chunk_total > 1:
             progress = chunk_progress
         else:
             progress = t_progress
-            
+
         # 转换为百分比
         percent = int(progress * 100)
-        
+
         # 每改变1%就更新一次显示
         if percent != self._last_percent:
             self._last_percent = percent
             if self.logger:
                 self.logger.info(f"MoviePy {self.operation_name}进度: {percent}%")
-    
+
     def callback(self, **changes):
         """处理其他类型的回调消息"""
         # 调用父类方法
         super().callback(**changes)
-        
+
         # 记录重要消息
         if 'message' in changes and self.logger:
             message = changes['message']
@@ -168,13 +181,13 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
     """从视频文件中提取音频，使用改进的进度记录器"""
     try:
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-        
+
         logger.info(f"开始从视频提取音频: {video_path} -> {audio_path}")
-        
+
         # 创建并配置进度记录器
         progress_logger = MoviePyProgressLogger(logger)
         progress_logger.set_operation_name("音频提取")
-        
+
         # 使用进度记录器处理视频
         video = VideoFileClip(video_path)
         video.audio.write_audiofile(
@@ -183,7 +196,7 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
             verbose=False  # 关闭MoviePy的内置进度输出
         )
         video.close()
-        
+
         logger.info(f"音频提取完成: {audio_path}")
         return True
     except Exception as e:
@@ -194,37 +207,82 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
 def generate_srt(audio_path: str, srt_path: str) -> bool:
     """从音频生成SRT字幕文件。"""
     try:
+        # 设置操作超时（5分钟）
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(300)  # 设置5分钟超时
+
+        logger.info(f"开始从音频生成字幕: {audio_path}")
+
+        # 记录每个步骤
+        logger.info(f"初始化语音识别引擎...")
         asr = KuaiShouASR(audio_path)
+
+        logger.info(f"执行语音识别...")
         asr_result = asr.run()
+
+        logger.info(f"处理识别结果...")
         asr_data = asr_result.segments
+
+        # 检查结果
+        if not asr_data:
+            logger.warning(f"语音识别没有返回任何文本段落: {audio_path}")
+            return False
+
+        logger.info(f"写入字幕文件: {srt_path}")
         with open(srt_path, "w", encoding="utf-8") as f:
             for index, asr in enumerate(asr_data):
                 f.write(asr.text + "\n\n")
+
+        # 取消超时
+        signal.alarm(0)
+
+        logger.info(f"字幕生成完成: {srt_path}")
         return True
-    except Exception as e:
-        logger.error(f"为 {audio_path} 生成SRT时出错: {e}")
+    except TimeoutError:
+        logger.error(f"为 {audio_path} 生成SRT时操作超时")
         return False
+    except Exception as e:
+        logger.error(f"为 {audio_path} 生成SRT时出错: {e}", exc_info=True)
+        # 打印详细的堆栈跟踪
+        logger.error(f"异常堆栈: {traceback.format_exc()}")
+        return False
+    finally:
+        # 确保超时被取消
+        signal.alarm(0)
 
 
 def is_processed(video_path: str) -> bool:
     """检查视频是否已经处理过。"""
-    with shelve.open(DB_PATH) as db:
-        return video_path in db
+    try:
+        with shelve.open(DB_PATH) as db:
+            return video_path in db
+    except Exception as e:
+        logger.error(f"检查视频处理状态时出错: {e}", exc_info=True)
+        return False
 
 
 def get_all_processed_videos() -> List[str]:
     """获取所有已处理的视频列表"""
-    with shelve.open(DB_PATH) as db:
-        return list(db.keys())
+    try:
+        with shelve.open(DB_PATH) as db:
+            return list(db.keys())
+    except Exception as e:
+        logger.error(f"获取已处理视频列表时出错: {e}", exc_info=True)
+        return []
 
 
 def update_db(video_path: str, srt_path: Optional[str] = None) -> None:
     """更新数据库的处理信息。"""
-    with shelve.open(DB_PATH) as db:
-        db[video_path] = {
-            "video_path": video_path,
-            "srt_path": srt_path
-        }
+    try:
+        with shelve.open(DB_PATH) as db:
+            db[video_path] = {
+                "video_path": video_path,
+                "srt_path": srt_path,
+                "timestamp": time.time(),
+                "status": "success" if srt_path else "failed"
+            }
+    except Exception as e:
+        logger.error(f"更新数据库时出错: {e}", exc_info=True)
 
 
 def is_file_ready(file_path: str, timeout: int = 60, check_interval: float = 1.0) -> bool:
@@ -232,167 +290,198 @@ def is_file_ready(file_path: str, timeout: int = 60, check_interval: float = 1.0
     检查文件是否已经完全写入（上传完成）
     
     通过监控文件大小在一段时间内是否保持稳定来判断文件是否上传完成
-    
-    参数:
-        file_path: 文件路径
-        timeout: 等待超时时间（秒）
-        check_interval: 检查间隔（秒）
-        
-    返回:
-        bool: 如果文件准备好可以处理，返回True；否则返回False
     """
-        # 初始化文件大小监控
+    # 初始化文件大小监控
     previous_size = -1
     stable_count = 0
     max_stable_count = 5  # 文件大小连续稳定的次数阈值
     logger.info(f"检查文件是否正在上传: {file_path}, 检查时间大约 {max_stable_count} s")
-    
+
     start_time = time.time()
-    
-    while time.time() - start_time < timeout:
-        # 检查文件是否存在
-        if not os.path.exists(file_path):
-            logger.warning(f"文件不存在或已被移除: {file_path}")
-            return False
-            
-        # 获取当前文件大小
-        try:
-            current_size = os.path.getsize(file_path)
-        except OSError as e:
-            logger.warning(f"无法获取文件大小: {file_path}, 错误: {e}")
+
+    try:
+        while time.time() - start_time < timeout:
+            # 检查文件是否存在
+            if not os.path.exists(file_path):
+                logger.warning(f"文件不存在或已被移除: {file_path}")
+                return False
+
+            # 获取当前文件大小
+            try:
+                current_size = os.path.getsize(file_path)
+            except OSError as e:
+                logger.warning(f"无法获取文件大小: {file_path}, 错误: {e}")
+                time.sleep(check_interval)
+                continue
+
+            # 检查文件大小是否稳定
+            if current_size == previous_size and current_size > 0:
+                stable_count += 1
+                if stable_count >= max_stable_count:
+                    logger.info(f"文件上传完成，大小稳定在 {current_size} 字节: {file_path}")
+                    return True
+            else:
+                stable_count = 0
+
+            previous_size = current_size
+
+            # 打印进度
+            elapsed = time.time() - start_time
+            logger.debug(f"正在等待文件上传: {file_path}, 当前大小: {current_size} 字节, 已等待: {elapsed:.1f}秒")
+
             time.sleep(check_interval)
-            continue
-        
-        # 检查文件大小是否稳定
-        if current_size == previous_size and current_size > 0:
-            stable_count += 1
-            if stable_count >= max_stable_count:
-                logger.info(f"文件上传完成，大小稳定在 {current_size} 字节: {file_path}")
-                return True
-        else:
-            stable_count = 0
-            
-        previous_size = current_size
-        
-        # 打印进度
-        elapsed = time.time() - start_time
-        logger.debug(f"正在等待文件上传: {file_path}, 当前大小: {current_size} 字节, 已等待: {elapsed:.1f}秒")
-        
-        time.sleep(check_interval)
-    
-    logger.warning(f"等待文件上传超时: {file_path}")
-    return False
+
+        logger.warning(f"等待文件上传超时: {file_path}")
+        return False
+    except Exception as e:
+        logger.error(f"检查文件是否准备好时出错: {file_path}, 错误: {e}", exc_info=True)
+        return False
 
 
 def get_target_paths(video_path: str) -> Dict[str, str]:
     """
     根据视频文件路径生成对应的音频和SRT字幕文件路径
-    
-    参数:
-        video_path: 视频文件的完整路径
-        
-    返回:
-        包含音频和SRT文件路径的字典
     """
-    # 获取视频文件相对于SOURCE_DIR的路径
-    rel_path = os.path.relpath(video_path, SOURCE_DIR)
-    
-    # 获取文件名（不含扩展名）
-    file_dir, file_name = os.path.split(rel_path)
-    file_base, _ = os.path.splitext(file_name)
-    
-    # 构建目标目录
-    target_subdir = os.path.join(TARGET_DIR, file_dir)
-    
-    # 确保目标目录存在
-    os.makedirs(target_subdir, exist_ok=True)
-    
-    # 构建音频和SRT文件路径
-    audio_path = os.path.join(target_subdir, f"{file_base}.mp3")
-    srt_path = os.path.join(target_subdir, f"{file_base}.txt")
-    
-    return {
-        "audio_path": audio_path,
-        "srt_path": srt_path
-    }
+    try:
+        # 获取视频文件相对于SOURCE_DIR的路径
+        rel_path = os.path.relpath(video_path, SOURCE_DIR)
+
+        # 获取文件名（不含扩展名）
+        file_dir, file_name = os.path.split(rel_path)
+        file_base, _ = os.path.splitext(file_name)
+
+        # 构建目标目录
+        target_subdir = os.path.join(TARGET_DIR, file_dir)
+
+        # 确保目标目录存在
+        os.makedirs(target_subdir, exist_ok=True)
+
+        # 构建音频和SRT文件路径
+        audio_path = os.path.join(target_subdir, f"{file_base}.mp3")
+        srt_path = os.path.join(target_subdir, f"{file_base}.txt")
+
+        return {
+            "audio_path": audio_path,
+            "srt_path": srt_path
+        }
+    except Exception as e:
+        logger.error(f"生成目标路径时出错: {video_path}, 错误: {e}", exc_info=True)
+        # 返回一个安全的默认值
+        return {
+            "audio_path": "",
+            "srt_path": ""
+        }
 
 
 def process_video(video_path: str) -> None:
     """处理视频以生成SRT字幕文件。"""
-    # 如果已处理过则跳过
-    if is_processed(video_path):
-        logger.info(f"跳过已处理的视频: {video_path}")
-        return
-    
-    logger.info(f"准备处理视频: {video_path}")
-    
-    # 确保文件已经完全上传
-    if not is_file_ready(video_path):
-        logger.error(f"文件未准备好，跳过处理: {video_path}")
-        return
-    
-    # 生成目标路径
-    target_paths = get_target_paths(video_path)
-    audio_path = target_paths["audio_path"]
-    srt_path = target_paths["srt_path"]
-    
-    # 检查SRT文件是否已存在
-    if os.path.exists(srt_path):
-        logger.info(f"SRT文件已存在: {srt_path}")
-        update_db(video_path, srt_path)
-        return
-    
-    # 提取音频
-    if not extract_audio(video_path, audio_path):
-        update_db(video_path, None)
-        return
-    
-    # 生成SRT
-    if generate_srt(audio_path, srt_path):
-        update_db(video_path, srt_path)
-        logger.info(f"成功生成SRT: {srt_path}")
-        
-        # 删除音频文件以节省空间
+    global total_videos_processed, total_videos_skipped, total_videos_failed
+
+    try:
+        # 如果已处理过则跳过
+        if is_processed(video_path):
+            logger.info(f"跳过已处理的视频: {video_path}")
+            total_videos_skipped += 1
+            return
+
+        logger.info(f"准备处理视频: {video_path}")
+
+        # 确保文件已经完全上传
+        if not is_file_ready(video_path):
+            logger.error(f"文件未准备好，跳过处理: {video_path}")
+            # 不将未准备好的文件标记为已处理，下次仍会尝试
+            return
+
+        # 生成目标路径
+        target_paths = get_target_paths(video_path)
+        audio_path = target_paths["audio_path"]
+        srt_path = target_paths["srt_path"]
+
+        if not audio_path or not srt_path:
+            logger.error(f"无法生成目标路径，跳过处理: {video_path}")
+            update_db(video_path, None)
+            total_videos_failed += 1
+            return
+
+        # 检查SRT文件是否已存在
+        if os.path.exists(srt_path):
+            logger.info(f"SRT文件已存在: {srt_path}")
+            update_db(video_path, srt_path)
+            total_videos_processed += 1
+            return
+
+        # 提取音频
+        if not extract_audio(video_path, audio_path):
+            logger.error(f"提取音频失败: {video_path}")
+            update_db(video_path, None)
+            total_videos_failed += 1
+            return
+
+        # 生成SRT
+        if generate_srt(audio_path, srt_path):
+            update_db(video_path, srt_path)
+            logger.info(f"成功生成SRT: {srt_path}")
+            total_videos_processed += 1
+
+            # 删除音频文件以节省空间
+            try:
+                os.remove(audio_path)
+                logger.info(f"已删除临时音频文件: {audio_path}")
+            except Exception as e:
+                logger.warning(f"删除音频文件 {audio_path} 时出错: {e}")
+        else:
+            update_db(video_path, None)
+            logger.error(f"为 {video_path} 生成SRT失败")
+            total_videos_failed += 1
+    except Exception as e:
+        # 捕获处理单个视频过程中的所有异常
+        logger.error(f"处理视频时发生未预期的错误: {video_path}, 错误: {e}", exc_info=True)
         try:
-            os.remove(audio_path)
-            logger.info(f"已删除临时音频文件: {audio_path}")
-        except Exception as e:
-            logger.warning(f"删除音频文件 {audio_path} 时出错: {e}")
-    else:
-        update_db(video_path, None)
-        logger.error(f"为 {video_path} 生成SRT失败")
+            update_db(video_path, None)
+        except:
+            pass
+        total_videos_failed += 1
 
 
 def scan_directory(directory: str) -> None:
     """递归扫描目录中的视频文件并处理它们。"""
     global total_videos_found, pending_videos
 
-    logger.info(f"开始扫描目录: {directory}")
+    try:
+        logger.info(f"开始扫描目录: {directory}")
 
-    # 收集所有视频文件
-    video_files = []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            file_path = os.path.join(root, file)
-            _, ext = os.path.splitext(file_path)
-            if ext.lower() in VIDEO_EXTENSIONS:
-                video_files.append(file_path)
+        # 收集所有视频文件
+        video_files = []
+        for root, _, files in os.walk(directory):
+            for file in files:
+                file_path = os.path.join(root, file)
+                _, ext = os.path.splitext(file_path)
+                if ext.lower() in VIDEO_EXTENSIONS:
+                    video_files.append(file_path)
 
-    total_videos_found = len(video_files)
-    logger.info(f"发现视频文件总数: {total_videos_found}")
+        total_videos_found = len(video_files)
+        logger.info(f"发现视频文件总数: {total_videos_found}")
 
-    # 获取已处理视频列表
-    processed_videos = get_all_processed_videos()
-    pending_videos = sum(1 for v in video_files if v not in processed_videos)
-    logger.info(f"待处理视频数量: {pending_videos}")
+        # 获取已处理视频列表
+        processed_videos = get_all_processed_videos()
+        pending_videos = sum(1 for v in video_files if v not in processed_videos)
+        logger.info(f"待处理视频数量: {pending_videos}")
 
-    # 处理所有视频文件
-    for index, file_path in enumerate(video_files, 1):
-        logger.info(f"处理第 {index}/{total_videos_found} 个视频文件: {os.path.basename(file_path)}")
-        process_video(file_path)
+        # 处理所有视频文件
+        for index, file_path in enumerate(video_files, 1):
+            try:
+                logger.info(f"处理第 {index}/{total_videos_found} 个视频文件: {os.path.basename(file_path)}")
+                process_video(file_path)
+            except Exception as e:
+                # 捕获处理单个视频的异常，确保扫描过程不会中断
+                logger.error(f"处理视频 {file_path} 时出错，继续处理下一个: {e}", exc_info=True)
+                continue
 
-    logger.info(
-        f"目录扫描完成: 共发现 {total_videos_found} 个视频, 处理 {total_videos_processed} 个, 跳过 {total_videos_skipped} 个")
+        logger.info(
+            f"目录扫描完成: 共发现 {total_videos_found} 个视频, 处理 {total_videos_processed} 个, "
+            f"跳过 {total_videos_skipped} 个, 失败 {total_videos_failed} 个")
+    except Exception as e:
+        logger.error(f"扫描目录时出错: {e}", exc_info=True)
 
 
 class VideoHandler(FileSystemEventHandler):
@@ -405,28 +494,48 @@ class VideoHandler(FileSystemEventHandler):
     def on_created(self, event):
         global new_videos_detected, pending_videos
 
-        if not event.is_directory:
-            file_path = event.src_path
-            _, ext = os.path.splitext(file_path)
-            if ext.lower() in VIDEO_EXTENSIONS:
-                new_videos_detected += 1
-                pending_videos += 1
-                self.new_videos.append(file_path)
-                logger.info("-" * 70)
-                logger.info(f"检测到新视频 [{new_videos_detected}]: {file_path}")
-                logger.info(f"当前累计未处理视频数: {pending_videos}")
-                process_video(file_path)
-                pending_videos -= 1
+        try:
+            if not event.is_directory:
+                file_path = event.src_path
+                _, ext = os.path.splitext(file_path)
+                if ext.lower() in VIDEO_EXTENSIONS:
+                    new_videos_detected += 1
+                    pending_videos += 1
+                    self.new_videos.append(file_path)
+                    logger.info("-" * 70)
+                    logger.info(f"检测到新视频 [{new_videos_detected}]: {file_path}")
+                    logger.info(f"当前累计未处理视频数: {pending_videos}")
+
+                    # 在单独的线程中处理视频，避免阻塞文件监控
+                    threading.Thread(target=self._process_video_safe, args=(file_path,)).start()
+        except Exception as e:
+            logger.error(f"文件创建事件处理出错: {e}", exc_info=True)
 
     def on_modified(self, event):
-        # 某些系统会同时触发created和modified事件
-        # 仅当数据库中不存在时才处理
-        if not event.is_directory:
-            file_path = event.src_path
-            _, ext = os.path.splitext(file_path)
-            if ext.lower() in VIDEO_EXTENSIONS and not is_processed(file_path) and file_path not in self.new_videos:
-                logger.info(f"检测到修改的视频: {file_path}")
-                process_video(file_path)
+        try:
+            # 某些系统会同时触发created和modified事件
+            # 仅当数据库中不存在时才处理
+            if not event.is_directory:
+                file_path = event.src_path
+                _, ext = os.path.splitext(file_path)
+                if ext.lower() in VIDEO_EXTENSIONS and not is_processed(file_path) and file_path not in self.new_videos:
+                    logger.info(f"检测到修改的视频: {file_path}")
+
+                    # 在单独的线程中处理视频
+                    threading.Thread(target=self._process_video_safe, args=(file_path,)).start()
+        except Exception as e:
+            logger.error(f"文件修改事件处理出错: {e}", exc_info=True)
+
+    def _process_video_safe(self, file_path):
+        """安全地处理视频，确保异常被捕获"""
+        global pending_videos
+        try:
+            process_video(file_path)
+        except Exception as e:
+            logger.error(f"处理视频时出错: {file_path}, 错误: {e}", exc_info=True)
+        finally:
+            # 无论处理是否成功，都减少待处理计数
+            pending_videos -= 1
 
 
 def print_statistics():
@@ -436,6 +545,7 @@ def print_statistics():
     logger.info(f"发现视频总数: {total_videos_found}")
     logger.info(f"已处理视频数: {total_videos_processed}")
     logger.info(f"已跳过视频数: {total_videos_skipped}")
+    logger.info(f"处理失败视频数: {total_videos_failed}")
     logger.info(f"新增视频数量: {new_videos_detected}")
     logger.info(f"待处理视频数: {pending_videos}")
     logger.info("=" * 50)
@@ -446,12 +556,12 @@ def setup_logging(log_dir=None):
     设置日志配置，使用TimedRotatingFileHandler确保日志实时刷新
     
     参数:
-        log_dir: 日志目录，如果为None则使用默认目录(项目根目录下的logs)
+        log_dir: 日志目录，如果为None则使用当前工作目录下的logs
     """
-    # 如果没有指定日志目录，则使用默认目录
+    # 使用当前工作目录下的logs目录
     if log_dir is None:
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-    
+        log_dir = os.path.join(os.getcwd(), "logs")
+
     # 创建日志目录
     os.makedirs(log_dir, exist_ok=True)
 
@@ -478,64 +588,110 @@ def setup_logging(log_dir=None):
     )
     file_handler.setFormatter(log_format)
     file_handler.setLevel(logging.INFO)
-    
+
     # 创建标准控制台处理器
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(log_format)
     console_handler.setLevel(logging.INFO)
 
+    # 创建错误日志文件处理器，单独记录错误信息
+    error_log_file = os.path.join(log_dir, "error.log")
+    error_handler = logging.FileHandler(
+        filename=error_log_file,
+        encoding='utf-8'
+    )
+    error_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(levelname)s - %(message)s\n%(pathname)s:%(lineno)d\n%(exc_info)s'))
+    error_handler.setLevel(logging.ERROR)
+
     # 添加处理器到logger
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-    
-    logger.info(f"日志系统初始化完成，日志文件: {log_file}")
+    logger.addHandler(error_handler)
+
+    logger.info(f"日志系统初始化完成，日志文件: {log_file}, 错误日志: {error_log_file}")
+
 
 # 确保程序退出时正确关闭日志处理器
 import atexit
+
+
 def close_logger():
     for handler in logger.handlers:
         handler.close()
         logger.removeHandler(handler)
+
+
 atexit.register(close_logger)
 
 
 def main():
     """主入口点。"""
-    # 初始化基本日志配置（仅控制台输出）
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logger.addHandler(console_handler)
-    
-    # 加载配置
-    load_config()
-    
-    # 现在可以设置日志到TARGET_DIR上一层的.cache/logs目录
-    logs_dir = os.path.join(os.path.dirname(TARGET_DIR), ".cache", "logs")
-    setup_logging(logs_dir)
-    
-    # 确保目标目录存在
-    os.makedirs(TARGET_DIR, exist_ok=True)
-
-    # 处理现有视频
-    scan_directory(SOURCE_DIR)
-
-    # 设置watchdog观察者
-    event_handler = VideoHandler()
-    observer = Observer()
-    observer.schedule(event_handler, SOURCE_DIR, recursive=True)
-    observer.start()
-
-    logger.info(f"监视 {SOURCE_DIR} 的变化")
-
     try:
+        # 初始化基本日志配置（仅控制台输出）
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            logger.addHandler(console_handler)
+
+        # 加载配置
+        load_config()
+
+        # 使用当前工作目录下的logs目录
+        setup_logging()  # 不传参数，使用默认的当前工作目录下的logs
+
+        # 确保目标目录存在
+        os.makedirs(TARGET_DIR, exist_ok=True)
+
+        # 处理现有视频
+        scan_directory(SOURCE_DIR)
+
+        # 设置watchdog观察者
+        event_handler = VideoHandler()
+        observer = Observer()
+        observer.schedule(event_handler, SOURCE_DIR, recursive=True)
+        observer.start()
+
+        logger.info(f"监视 {SOURCE_DIR} 的变化")
+
+        # 定期打印统计信息
         while True:
-            time.sleep(1)
+            time.sleep(3600)  # 每小时打印一次统计信息
+            print_statistics()
     except KeyboardInterrupt:
+        logger.info("接收到停止信号，正在停止服务...")
         observer.stop()
-    observer.join()
+        observer.join()
+    except Exception as e:
+        logger.critical(f"程序运行出错: {e}", exc_info=True)
+        # 尝试继续运行
+        try:
+            # 如果observer已定义，尝试停止它
+            if 'observer' in locals() and observer.is_alive():
+                observer.stop()
+                observer.join()
+
+            # 重新启动主循环
+            logger.info("尝试恢复服务...")
+            main()
+        except:
+            logger.critical("无法恢复服务，程序终止", exc_info=True)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    # 确保即使在logging系统初始化前也能记录日志
+    try:
+        # 设置一个基本的日志配置，确保在main初始化前也能记录错误
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[logging.StreamHandler()]
+        )
+        main()
+    except Exception as e:
+        # 使用logger而不是print
+        logger.critical(f"严重错误: {e}")
+        logger.critical(f"异常堆栈: {traceback.format_exc()}")
+        sys.exit(1)
