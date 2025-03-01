@@ -1,0 +1,6 @@
+# 生产环境配置
+paths:
+  # 生产环境源视频目录
+  source_dir: /volume1/Bililive/抖音/霞湖世家官方旗舰店
+  # 生产环境字幕输出目录
+  target_dir: /volume1/Bililive/抖音/字幕/data

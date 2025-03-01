@@ -1,0 +1,4 @@
+# 应用主配置文件
+service:
+  # 当前环境配置 (dev=开发环境, prod=生产环境)
+  profile: dev
