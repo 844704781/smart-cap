@@ -37,7 +37,7 @@ class KuaiShouASR(BaseASR):
 
 
 if __name__ == '__main__':
-    audio_file = r"extracted_audio.wav"
+    audio_file = r"C:\Users\watermelon\Documents\WeChat Files\wxid_kg218b1bkomi21\FileStorage\File\2025-03\1.mp3"
     asr = KuaiShouASR(audio_file)
     asr_data = asr.run()
 
