@@ -168,15 +168,16 @@ class MoviePyProgressLogger(ProgressBarLogger):
 
 def extract_audio(video_path: str, audio_path: str) -> bool:
     """从视频文件中提取音频，使用改进的进度记录器"""
+    video = None
     try:
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-        
+
         logger.info(f"开始从视频提取音频: {video_path} -> {audio_path}")
-        
+
         # 创建并配置进度记录器
         progress_logger = MoviePyProgressLogger(logger)
         progress_logger.set_operation_name("音频提取")
-        
+
         # 使用进度记录器处理视频
         video = VideoFileClip(video_path)
         video.audio.write_audiofile(
@@ -184,13 +185,17 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
             logger=progress_logger,
             verbose=False  # 关闭MoviePy的内置进度输出
         )
-        video.close()
-        
+
         logger.info(f"音频提取完成: {audio_path}")
         return True
     except Exception as e:
         logger.error(f"从 {video_path} 提取音频时出错: {e}", exc_info=True)
         return False
+    finally:
+        try:
+            video.close()
+        except:
+            pass
 
 
 def generate_srt(audio_path: str, srt_path: str) -> bool:
@@ -498,11 +503,11 @@ def setup_logging(log_dir=None):
     设置日志配置，使用TimedRotatingFileHandler确保日志实时刷新
     
     参数:
-        log_dir: 日志目录，如果为None则使用默认目录(项目根目录下的logs)
+        log_dir: 日志目录，如果为None则使用项目根目录
     """
-    # 如果没有指定日志目录，则使用默认目录
+    # 如果没有指定日志目录，则使用项目根目录
     if log_dir is None:
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        log_dir = os.path.dirname(os.path.abspath(__file__))
     
     # 创建日志目录
     os.makedirs(log_dir, exist_ok=True)
@@ -563,9 +568,8 @@ def main():
     # 加载配置
     load_config()
     
-    # 现在可以设置日志到TARGET_DIR上一层的.cache/logs目录
-    logs_dir = os.path.join(os.path.dirname(TARGET_DIR), ".cache", "logs")
-    setup_logging(logs_dir)
+    # 设置日志到项目根目录
+    setup_logging()
     
     # 确保目标目录存在
     os.makedirs(TARGET_DIR, exist_ok=True)
