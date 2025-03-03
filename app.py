@@ -37,7 +37,7 @@ pending_videos = 0
 stats_lock = threading.Lock()
 
 # 创建线程池
-video_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="video_processor")
+video_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video_processor")
 
 # 添加一个新的全局变量来跟踪正在处理的视频和任务
 processing_videos = set()
@@ -690,59 +690,77 @@ def submit_task(video_path, task_func):
     """
     global running_tasks
     
-    # 清理已完成的任务
-    with threading.Lock():  # 添加锁来保护字典访问
-        # 先复制一份字典的键，避免在遍历时修改
-        task_keys = list(running_tasks.keys())
-        completed_tasks = [path for path in task_keys if running_tasks[path].done()]
-        for path in completed_tasks:
-            future = running_tasks.pop(path)
-            try:
-                # 检查任务是否有异常
-                if future.exception():
-                    logger.error(f"任务处理 {path} 失败: {future.exception()}")
-            except Exception:
-                pass
-        
-        # 检查当前正在运行的任务数量
-        running_count = len(running_tasks)
-        max_workers = video_executor._max_workers
-        
-        if running_count < max_workers:
-            # 线程池未满，直接提交任务
-            logger.info(f"提交新任务处理视频: {video_path} (运行中: {running_count}/{max_workers})")
-            future = video_executor.submit(task_func, video_path)
-            running_tasks[video_path] = future
-        else:
-            # 线程池已满，定期尝试提交
-            logger.info(f"线程池已满 ({running_count}/{max_workers})，将延迟处理视频: {video_path}")
+    with threading.Lock():  # 使用锁保护整个操作
+        try:
+            # 检查任务是否已在运行
+            if video_path in running_tasks:
+                logger.debug(f"任务已在运行中: {video_path}")
+                return
+
+            # 清理已完成的任务
+            completed_tasks = []
+            for path, future in list(running_tasks.items()):
+                if future.done():
+                    completed_tasks.append(path)
+                    try:
+                        # 检查任务是否有异常
+                        if future.exception():
+                            logger.error(f"任务处理失败: {path}, 错误: {future.exception()}")
+                    except Exception:
+                        pass
             
-            # 启动一个守护线程来等待空闲线程并提交任务
-            def wait_and_submit():
-                while True:
-                    time.sleep(1)  # 每秒检查一次
-                    
-                    with threading.Lock():  # 添加锁来保护字典访问
-                        # 再次检查任务是否已在运行
-                        if video_path in running_tasks:
-                            return
-                        
-                        # 清理已完成的任务
-                        task_keys = list(running_tasks.keys())
-                        completed = [p for p in task_keys if running_tasks[p].done()]
-                        for p in completed:
-                            running_tasks.pop(p)
-                        
-                        # 检查是否有空闲线程
-                        if len(running_tasks) < max_workers:
-                            logger.info(f"线程池有空闲，现在提交延迟的视频处理: {video_path}")
-                            future = video_executor.submit(task_func, video_path)
-                            running_tasks[video_path] = future
-                            return
+            # 安全移除已完成的任务
+            for path in completed_tasks:
+                running_tasks.pop(path, None)
             
-            # 启动守护线程
-            submit_thread = threading.Thread(target=wait_and_submit, daemon=True)
-            submit_thread.start()
+            # 检查当前正在运行的任务数量
+            running_count = len(running_tasks)
+            max_workers = video_executor._max_workers
+            
+            if running_count < max_workers:
+                # 线程池未满，直接提交任务
+                logger.info(f"提交新任务处理视频: {video_path} (运行中: {running_count}/{max_workers})")
+                future = video_executor.submit(task_func, video_path)
+                running_tasks[video_path] = future
+            else:
+                # 线程池已满，定期尝试提交
+                logger.info(f"线程池已满 ({running_count}/{max_workers})，将延迟处理视频: {video_path}")
+                
+                def wait_and_submit():
+                    while True:
+                        time.sleep(1)  # 每秒检查一次
+                        
+                        with threading.Lock():
+                            try:
+                                # 再次检查任务是否已在运行
+                                if video_path in running_tasks:
+                                    return
+                                
+                                # 清理已完成的任务
+                                completed = []
+                                for p, f in list(running_tasks.items()):
+                                    if f.done():
+                                        completed.append(p)
+                                
+                                # 安全移除已完成的任务
+                                for p in completed:
+                                    running_tasks.pop(p, None)
+                                
+                                # 检查是否有空闲线程
+                                if len(running_tasks) < max_workers:
+                                    logger.info(f"线程池有空闲，现在提交延迟的视频处理: {video_path}")
+                                    future = video_executor.submit(task_func, video_path)
+                                    running_tasks[video_path] = future
+                                    return
+                            except Exception as e:
+                                logger.error(f"等待提交任务时出错: {e}")
+                                return
+                
+                # 启动守护线程
+                submit_thread = threading.Thread(target=wait_and_submit, daemon=True)
+                submit_thread.start()
+        except Exception as e:
+            logger.error(f"提交任务时出错: {e}")
 
 
 def main():
