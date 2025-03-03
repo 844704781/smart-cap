@@ -16,6 +16,7 @@ from contextlib import redirect_stdout, redirect_stderr
 from proglog import TqdmProgressBarLogger, ProgressBarLogger
 import re
 import threading
+import json
 
 from srt.ksasr import KuaiShouASR
 
@@ -29,11 +30,12 @@ CACHE_DIR = ""
 DB_PATH = ""
 
 # 统计信息全局变量
-total_videos_found = 0
-total_videos_processed = 0
-total_videos_skipped = 0
-new_videos_detected = 0
-pending_videos = 0
+total_videos_found = 0  # 初始扫描时发现的视频总数
+total_videos_processed = 0  # 当前已处理的视频数
+last_task_skipped = 0  # 上次任务执行时跳过的视频数
+total_videos_skipped = 0  # 当前任务执行时跳过的视频数
+new_videos_detected = 0  # 新检测到的视频数
+pending_videos = 0  # 待处理的视频数
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,7 @@ def load_config():
         # 创建.cache目录并将数据库文件存储在其中
         cache_dir = CACHE_DIR
         os.makedirs(cache_dir, exist_ok=True)
-        DB_PATH = os.path.join(cache_dir, ".video_srt_index")
+        DB_PATH = os.path.join(cache_dir, "video_srt_index.json")
 
         logger.info(f"配置加载成功: SOURCE_DIR={SOURCE_DIR}, TARGET_DIR={TARGET_DIR}, CACHE_DIR={CACHE_DIR}")
         logger.info(f"数据库文件位置: {DB_PATH}")
@@ -208,23 +210,50 @@ def generate_srt(audio_path: str, srt_path: str) -> bool:
 
 def is_processed(video_path: str) -> bool:
     """检查视频是否已经处理过。"""
-    with shelve.open(DB_PATH) as db:
-        return video_path in db
+    try:
+        if not os.path.exists(DB_PATH):
+            return False
+        with open(DB_PATH, 'r', encoding='utf-8') as f:
+            db = json.load(f)
+            return video_path in db
+    except Exception as e:
+        logger.error(f"读取数据库文件失败: {e}")
+        return False
 
 
 def get_all_processed_videos() -> List[str]:
     """获取所有已处理的视频列表"""
-    with shelve.open(DB_PATH) as db:
-        return list(db.keys())
+    try:
+        if not os.path.exists(DB_PATH):
+            return []
+        with open(DB_PATH, 'r', encoding='utf-8') as f:
+            db = json.load(f)
+            return list(db.keys())
+    except Exception as e:
+        logger.error(f"读取数据库文件失败: {e}")
+        return []
 
 
 def update_db(video_path: str, srt_path: Optional[str] = None) -> None:
     """更新数据库的处理信息。"""
-    with shelve.open(DB_PATH) as db:
+    try:
+        # 读取现有数据
+        db = {}
+        if os.path.exists(DB_PATH):
+            with open(DB_PATH, 'r', encoding='utf-8') as f:
+                db = json.load(f)
+        
+        # 更新数据
         db[video_path] = {
             "video_path": video_path,
             "srt_path": srt_path
         }
+        
+        # 写入更新后的数据
+        with open(DB_PATH, 'w', encoding='utf-8') as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"更新数据库文件失败: {e}")
 
 
 def is_file_ready(file_path: str, timeout: int = 60, check_interval: float = 1.0) -> bool:
@@ -319,9 +348,13 @@ def get_target_paths(video_path: str) -> Dict[str, str]:
 
 def process_video(video_path: str) -> None:
     """处理视频以生成SRT字幕文件。"""
+    global total_videos_processed, total_videos_skipped
+    
     # 如果已处理过则跳过
     if is_processed(video_path):
+        total_videos_skipped += 1
         logger.info(f"跳过已处理的视频: {video_path}")
+        print_statistics()  # 每次跳过视频时打印统计信息
         return
     
     logger.info(f"准备处理视频: {video_path}")
@@ -329,6 +362,8 @@ def process_video(video_path: str) -> None:
     # 确保文件已经完全上传
     if not is_file_ready(video_path):
         logger.error(f"文件未准备好，跳过处理: {video_path}")
+        total_videos_skipped += 1
+        print_statistics()  # 每次跳过视频时打印统计信息
         return
     
     # 生成目标路径
@@ -340,17 +375,22 @@ def process_video(video_path: str) -> None:
     if os.path.exists(srt_path):
         logger.info(f"SRT文件已存在: {srt_path}")
         update_db(video_path, srt_path)
+        total_videos_skipped += 1
+        print_statistics()  # 每次跳过视频时打印统计信息
         return
     
     # 提取音频
     if not extract_audio(video_path, audio_path):
         update_db(video_path, None)
+        total_videos_skipped += 1
+        print_statistics()  # 每次跳过视频时打印统计信息
         return
     
     # 生成SRT
     if generate_srt(audio_path, srt_path):
         update_db(video_path, srt_path)
         logger.info(f"成功生成SRT: {srt_path}")
+        total_videos_processed += 1
         
         # 删除音频文件以节省空间
         try:
@@ -360,15 +400,23 @@ def process_video(video_path: str) -> None:
             logger.warning(f"删除音频文件 {audio_path} 时出错: {e}")
     else:
         update_db(video_path, None)
+        total_videos_skipped += 1
         logger.error(f"为 {video_path} 生成SRT失败")
+    
+    print_statistics()  # 每次处理完视频时打印统计信息
 
 
 def scan_directory(directory: str) -> None:
     """递归扫描目录中的视频文件并处理它们。"""
-    global total_videos_found, pending_videos
-
+    global total_videos_found, pending_videos, total_videos_skipped, last_task_skipped
+    
     logger.info(f"开始扫描目录: {directory}")
-
+    
+    # 保存上次任务的跳过数量
+    last_task_skipped = total_videos_skipped
+    # 重置当前任务的统计数据
+    total_videos_skipped = 0
+    
     # 收集所有视频文件
     video_files = []
     for root, _, files in os.walk(directory):
@@ -377,22 +425,25 @@ def scan_directory(directory: str) -> None:
             _, ext = os.path.splitext(file_path)
             if ext.lower() in VIDEO_EXTENSIONS:
                 video_files.append(file_path)
-
-    total_videos_found = len(video_files)
+    
+    total_videos_found = len(video_files)  # 设置初始发现的视频总数
     logger.info(f"发现视频文件总数: {total_videos_found}")
-
+    
     # 获取已处理视频列表
     processed_videos = get_all_processed_videos()
     pending_videos = sum(1 for v in video_files if v not in processed_videos)
     logger.info(f"待处理视频数量: {pending_videos}")
-
+    
+    print_statistics()  # 在扫描完成后打印初始统计信息
+    
     # 处理所有视频文件
     for index, file_path in enumerate(video_files, 1):
         logger.info(f"处理第 {index}/{total_videos_found} 个视频文件: {os.path.basename(file_path)}")
         process_video(file_path)
-
+    
     logger.info(
         f"目录扫描完成: 共发现 {total_videos_found} 个视频, 处理 {total_videos_processed} 个, 跳过 {total_videos_skipped} 个")
+    print_statistics()  # 在所有处理完成后打印最终统计信息
 
 
 class VideoHandler(FileSystemEventHandler):
@@ -435,7 +486,8 @@ def print_statistics():
     logger.info("当前统计信息:")
     logger.info(f"发现视频总数: {total_videos_found}")
     logger.info(f"已处理视频数: {total_videos_processed}")
-    logger.info(f"已跳过视频数: {total_videos_skipped}")
+    logger.info(f"上次任务跳过数: {last_task_skipped}")
+    logger.info(f"当前任务跳过数: {total_videos_skipped}")
     logger.info(f"新增视频数量: {new_videos_detected}")
     logger.info(f"待处理视频数: {pending_videos}")
     logger.info("=" * 50)
