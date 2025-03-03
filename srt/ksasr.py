@@ -22,7 +22,8 @@ class KuaiShouASR(BaseASR):
             "typeId": "1"
         }
         files = [('file', ('test.mp3', self.file_binary, 'audio/mpeg'))]
-        result = requests.post("https://ai.kuaishou.com/api/effects/subtitle_generate", data=payload, files=files)
+        result = requests.post("https://ai.kuaishou.com/api/effects/subtitle_generate", data=payload, files=files,
+                               timeout=(30, 120))
         if not result.ok:
             raise Exception(f"Error: {result.status_code} {result.text}")
 
