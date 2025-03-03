@@ -273,7 +273,7 @@ def is_file_ready(file_path: str, timeout: int = 60, check_interval: float = 1.0
         # 初始化文件大小监控
     previous_size = -1
     stable_count = 0
-    max_stable_count = 5  # 文件大小连续稳定的次数阈值
+    max_stable_count = 2  # 文件大小连续稳定的次数阈值
     logger.info(f"检查文件是否正在上传: {file_path}, 检查时间大约 {max_stable_count} s")
     
     start_time = time.time()
@@ -359,13 +359,6 @@ def process_video(video_path: str) -> None:
     
     logger.info(f"准备处理视频: {video_path}")
     
-    # 确保文件已经完全上传
-    if not is_file_ready(video_path):
-        logger.error(f"文件未准备好，跳过处理: {video_path}")
-        total_videos_skipped += 1
-        print_statistics()  # 每次跳过视频时打印统计信息
-        return
-    
     # 生成目标路径
     target_paths = get_target_paths(video_path)
     audio_path = target_paths["audio_path"]
@@ -375,6 +368,13 @@ def process_video(video_path: str) -> None:
     if os.path.exists(srt_path):
         logger.info(f"SRT文件已存在: {srt_path}")
         update_db(video_path, srt_path)
+        total_videos_skipped += 1
+        print_statistics()  # 每次跳过视频时打印统计信息
+        return
+    
+    # 确保文件已经完全上传
+    if not is_file_ready(video_path):
+        logger.error(f"文件未准备好，跳过处理: {video_path}")
         total_videos_skipped += 1
         print_statistics()  # 每次跳过视频时打印统计信息
         return
