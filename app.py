@@ -1,22 +1,16 @@
-import datetime
+import logging
+import json
 import logging
 import os
-import shelve
 import time
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, List
 
 import yaml
 from moviepy.editor import VideoFileClip
+from proglog import ProgressBarLogger
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
-import sys
-from io import StringIO
-from contextlib import redirect_stdout, redirect_stderr
-from proglog import TqdmProgressBarLogger, ProgressBarLogger
-import re
-import threading
-import json
 
 from srt.ksasr import KuaiShouASR
 
@@ -67,7 +61,7 @@ def load_config():
 
         with open(env_config_path, 'r', encoding='utf-8') as f:
             env_config = yaml.safe_load(f)
-        
+
         # 从环境配置中获取目录设置
         SOURCE_DIR = env_config.get('paths', {}).get('source_dir')
         TARGET_DIR = env_config.get('paths', {}).get('target_dir')
@@ -105,7 +99,7 @@ class MoviePyProgressLogger(ProgressBarLogger):
         # 仅用于内部跟踪
         self._last_percent = -1
         self.operation_name = "音频提取"
-        
+
     def set_operation_name(self, name):
         """设置当前操作名称"""
         self.operation_name = name
@@ -123,32 +117,32 @@ class MoviePyProgressLogger(ProgressBarLogger):
                 self.t_total = value
             elif attr == 'index':
                 self.t_index = value
-                
+
         # 计算总体进度百分比
         chunk_progress = self.chunk_index / self.chunk_total if self.chunk_total > 0 else 0
         t_progress = self.t_index / self.t_total if self.t_total > 0 else 0
-        
+
         if self.t_total > 1 and self.chunk_total > 1:
             progress = (chunk_progress + t_progress) / 2
         elif self.chunk_total > 1:
             progress = chunk_progress
         else:
             progress = t_progress
-            
+
         # 转换为百分比
         percent = int(progress * 100)
-        
+
         # 每改变1%就更新一次显示
         if percent != self._last_percent:
             self._last_percent = percent
             if self.logger:
                 self.logger.info(f"MoviePy {self.operation_name}进度: {percent}%")
-    
+
     def callback(self, **changes):
         """处理其他类型的回调消息"""
         # 调用父类方法
         super().callback(**changes)
-        
+
         # 记录重要消息
         if 'message' in changes and self.logger:
             message = changes['message']
@@ -180,6 +174,9 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
 
         # 使用进度记录器处理视频
         video = VideoFileClip(video_path)
+        if video.audio is None:
+            logger.error(f"视频文件中没有音频: {video_path}")
+            return False
         video.audio.write_audiofile(
             audio_path,
             logger=progress_logger,
@@ -247,13 +244,13 @@ def update_db(video_path: str, srt_path: Optional[str] = None) -> None:
         if os.path.exists(DB_PATH):
             with open(DB_PATH, 'r', encoding='utf-8') as f:
                 db = json.load(f)
-        
+
         # 更新数据
         db[video_path] = {
             "video_path": video_path,
             "srt_path": srt_path
         }
-        
+
         # 写入更新后的数据
         with open(DB_PATH, 'w', encoding='utf-8') as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
@@ -275,20 +272,20 @@ def is_file_ready(file_path: str, timeout: int = 60, check_interval: float = 1.0
     返回:
         bool: 如果文件准备好可以处理，返回True；否则返回False
     """
-        # 初始化文件大小监控
+    # 初始化文件大小监控
     previous_size = -1
     stable_count = 0
     max_stable_count = 2  # 文件大小连续稳定的次数阈值
     logger.info(f"检查文件是否正在上传: {file_path}, 检查时间大约 {max_stable_count} s")
-    
+
     start_time = time.time()
-    
+
     while time.time() - start_time < timeout:
         # 检查文件是否存在
         if not os.path.exists(file_path):
             logger.warning(f"文件不存在或已被移除: {file_path}")
             return False
-            
+
         # 获取当前文件大小
         try:
             current_size = os.path.getsize(file_path)
@@ -296,7 +293,7 @@ def is_file_ready(file_path: str, timeout: int = 60, check_interval: float = 1.0
             logger.warning(f"无法获取文件大小: {file_path}, 错误: {e}")
             time.sleep(check_interval)
             continue
-        
+
         # 检查文件大小是否稳定
         if current_size == previous_size and current_size > 0:
             stable_count += 1
@@ -305,15 +302,15 @@ def is_file_ready(file_path: str, timeout: int = 60, check_interval: float = 1.0
                 return True
         else:
             stable_count = 0
-            
+
         previous_size = current_size
-        
+
         # 打印进度
         elapsed = time.time() - start_time
         logger.debug(f"正在等待文件上传: {file_path}, 当前大小: {current_size} 字节, 已等待: {elapsed:.1f}秒")
-        
+
         time.sleep(check_interval)
-    
+
     logger.warning(f"等待文件上传超时: {file_path}")
     return False
 
@@ -330,21 +327,21 @@ def get_target_paths(video_path: str) -> Dict[str, str]:
     """
     # 获取视频文件相对于SOURCE_DIR的路径
     rel_path = os.path.relpath(video_path, SOURCE_DIR)
-    
+
     # 获取文件名（不含扩展名）
     file_dir, file_name = os.path.split(rel_path)
     file_base, _ = os.path.splitext(file_name)
-    
+
     # 构建目标目录
     target_subdir = os.path.join(TARGET_DIR, file_dir)
-    
+
     # 确保目标目录存在
     os.makedirs(target_subdir, exist_ok=True)
-    
+
     # 构建音频和SRT文件路径
     audio_path = os.path.join(target_subdir, f"{file_base}.mp3")
     srt_path = os.path.join(target_subdir, f"{file_base}.txt")
-    
+
     return {
         "audio_path": audio_path,
         "srt_path": srt_path
@@ -354,21 +351,21 @@ def get_target_paths(video_path: str) -> Dict[str, str]:
 def process_video(video_path: str) -> None:
     """处理视频以生成SRT字幕文件。"""
     global total_videos_processed, total_videos_skipped
-    
+
     # 如果已处理过则跳过
     if is_processed(video_path):
         total_videos_skipped += 1
         logger.info(f"跳过已处理的视频: {video_path}")
         print_statistics()  # 每次跳过视频时打印统计信息
         return
-    
+
     logger.info(f"准备处理视频: {video_path}")
-    
+
     # 生成目标路径
     target_paths = get_target_paths(video_path)
     audio_path = target_paths["audio_path"]
     srt_path = target_paths["srt_path"]
-    
+
     # 检查SRT文件是否已存在
     if os.path.exists(srt_path):
         logger.info(f"SRT文件已存在: {srt_path}")
@@ -376,27 +373,27 @@ def process_video(video_path: str) -> None:
         total_videos_skipped += 1
         print_statistics()  # 每次跳过视频时打印统计信息
         return
-    
+
     # 确保文件已经完全上传
     if not is_file_ready(video_path):
         logger.error(f"文件未准备好，跳过处理: {video_path}")
         total_videos_skipped += 1
         print_statistics()  # 每次跳过视频时打印统计信息
         return
-    
+
     # 提取音频
     if not extract_audio(video_path, audio_path):
         update_db(video_path, None)
         total_videos_skipped += 1
         print_statistics()  # 每次跳过视频时打印统计信息
         return
-    
+
     # 生成SRT
     if generate_srt(audio_path, srt_path):
         update_db(video_path, srt_path)
         logger.info(f"成功生成SRT: {srt_path}")
         total_videos_processed += 1
-        
+
         # 删除音频文件以节省空间
         try:
             os.remove(audio_path)
@@ -407,21 +404,21 @@ def process_video(video_path: str) -> None:
         update_db(video_path, None)
         total_videos_skipped += 1
         logger.error(f"为 {video_path} 生成SRT失败")
-    
+
     print_statistics()  # 每次处理完视频时打印统计信息
 
 
 def scan_directory(directory: str) -> None:
     """递归扫描目录中的视频文件并处理它们。"""
     global total_videos_found, pending_videos, total_videos_skipped, last_task_skipped
-    
+
     logger.info(f"开始扫描目录: {directory}")
-    
+
     # 保存上次任务的跳过数量
     last_task_skipped = total_videos_skipped
     # 重置当前任务的统计数据
     total_videos_skipped = 0
-    
+
     # 收集所有视频文件
     video_files = []
     for root, _, files in os.walk(directory):
@@ -430,22 +427,22 @@ def scan_directory(directory: str) -> None:
             _, ext = os.path.splitext(file_path)
             if ext.lower() in VIDEO_EXTENSIONS:
                 video_files.append(file_path)
-    
+
     total_videos_found = len(video_files)  # 设置初始发现的视频总数
     logger.info(f"发现视频文件总数: {total_videos_found}")
-    
+
     # 获取已处理视频列表
     processed_videos = get_all_processed_videos()
     pending_videos = sum(1 for v in video_files if v not in processed_videos)
     logger.info(f"待处理视频数量: {pending_videos}")
-    
+
     print_statistics()  # 在扫描完成后打印初始统计信息
-    
+
     # 处理所有视频文件
     for index, file_path in enumerate(video_files, 1):
         logger.info(f"处理第 {index}/{total_videos_found} 个视频文件: {os.path.basename(file_path)}")
         process_video(file_path)
-    
+
     logger.info(
         f"目录扫描完成: 共发现 {total_videos_found} 个视频, 处理 {total_videos_processed} 个, 跳过 {total_videos_skipped} 个")
     print_statistics()  # 在所有处理完成后打印最终统计信息
@@ -508,7 +505,7 @@ def setup_logging(log_dir=None):
     # 如果没有指定日志目录，则使用项目根目录
     if log_dir is None:
         log_dir = os.path.dirname(os.path.abspath(__file__))
-    
+
     # 创建日志目录
     os.makedirs(log_dir, exist_ok=True)
 
@@ -535,7 +532,7 @@ def setup_logging(log_dir=None):
     )
     file_handler.setFormatter(log_format)
     file_handler.setLevel(logging.INFO)
-    
+
     # 创建标准控制台处理器
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(log_format)
@@ -544,15 +541,20 @@ def setup_logging(log_dir=None):
     # 添加处理器到logger
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-    
+
     logger.info(f"日志系统初始化完成，日志文件: {log_file}")
+
 
 # 确保程序退出时正确关闭日志处理器
 import atexit
+
+
 def close_logger():
     for handler in logger.handlers:
         handler.close()
         logger.removeHandler(handler)
+
+
 atexit.register(close_logger)
 
 
@@ -564,13 +566,13 @@ def main():
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
         logger.addHandler(console_handler)
-    
+
     # 加载配置
     load_config()
-    
+
     # 设置日志到项目根目录
     setup_logging()
-    
+
     # 确保目标目录存在
     os.makedirs(TARGET_DIR, exist_ok=True)
 

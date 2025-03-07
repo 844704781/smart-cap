@@ -11,11 +11,12 @@ RUN rm -rf /etc/apt/sources.list.d/* && \
     echo "deb https://mirrors.tuna.tsinghua.edu.cn/debian/ bookworm-backports main contrib non-free non-free-firmware" >> /etc/apt/sources.list && \
     echo "deb https://mirrors.tuna.tsinghua.edu.cn/debian-security bookworm-security main contrib non-free non-free-firmware" >> /etc/apt/sources.list
 
-# 安装系统依赖和ffmpeg
+# 安装系统依赖、ffmpeg和dumb-init
 RUN apt-get clean && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
+    dumb-init \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -37,5 +38,6 @@ RUN chmod +x /app/docker-entrypoint.sh
 # 创建默认目录
 RUN mkdir -p /app/videos /app/subtitles
 
-# 设置入口点
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+# 使用dumb-init作为入口点
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["/app/docker-entrypoint.sh"]

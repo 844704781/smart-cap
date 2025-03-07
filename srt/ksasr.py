@@ -5,7 +5,8 @@ from typing import List
 
 from .ASRDataSeg import ASRDataSeg
 from .BaseASR import BaseASR
-
+import logging
+logger = logging.getLogger(__name__)
 
 class KuaiShouASR(BaseASR):
     def __init__(self, audio_path: [str, bytes], use_cache: bool = False):
@@ -22,8 +23,10 @@ class KuaiShouASR(BaseASR):
             "typeId": "1"
         }
         files = [('file', ('test.mp3', self.file_binary, 'audio/mpeg'))]
+        logger.info(f"Submitting audio file to KuaiShou ASR...")
         result = requests.post("https://ai.kuaishou.com/api/effects/subtitle_generate", data=payload, files=files,
                                timeout=(30, 120))
+        logger.info(f"KuaiShou ASR submitted: {result.text},status code: {result.status_code}")
         if not result.ok:
             raise Exception(f"Error: {result.status_code} {result.text}")
 
@@ -31,6 +34,12 @@ class KuaiShouASR(BaseASR):
         if resp['code'] != 200:
             raise Exception(f"Error: {resp['code']} {resp['msg']}")
         for item in resp['data'].get('text'):
+            if not item.get('end_time'):
+                item['end_time'] = 0
+            if not item.get('start_time'):
+                item['start_time'] = 0
+            if not item.get('text'):
+                item['text'] = ''
             item['end_time'] = item['end_time'] * 1000
             item['start_time'] = item['start_time'] * 1000
         return resp
