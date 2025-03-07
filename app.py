@@ -1,4 +1,3 @@
-import logging
 import json
 import logging
 import os
@@ -160,13 +159,131 @@ class MoviePyProgressLogger(ProgressBarLogger):
                     self.logger.debug(f"MoviePy: {message}")
 
 
+def check_video_file_structure(video_path: str) -> bool:
+    """检查视频文件的基本结构是否完整"""
+    import os
+
+    try:
+        # 检查文件大小，极小的视频文件可能已损坏
+        file_size = os.path.getsize(video_path)
+        if file_size < 1024:  # 小于1KB的视频文件很可能是损坏的
+            logger.warning(f"视频文件过小，可能已损坏: {video_path}, 大小: {file_size} 字节")
+            return False
+
+        # 读取文件头以检查文件签名
+        with open(video_path, 'rb') as f:
+            header = f.read(12)  # 读取前12个字节
+
+        # 常见视频格式的文件头检查
+        # MP4格式通常以 'ftyp' 标记开始 (偏移4字节)
+        if b'ftyp' in header[4:8]:
+            return True
+        # AVI格式以 'RIFF' 开始，然后是文件大小，然后是 'AVI '
+        elif header[:4] == b'RIFF' and b'AVI ' in header[8:12]:
+            return True
+        # MKV格式通常以 '\x1A\x45\xDF\xA3' (EBML头) 开始
+        elif header[0:4] == b'\x1A\x45\xDF\xA3':
+            return True
+        # MOV格式通常与MP4类似
+        elif b'moov' in header[4:8] or b'mdat' in header[4:8]:
+            return True
+        else:
+            logger.warning(f"视频文件格式无法识别: {video_path}")
+            return False
+    except Exception as e:
+        logger.error(f"检查视频文件结构时出错: {video_path}, 错误: {e}")
+        return False
+
+
+def check_frame_at_time(video_path: str, time_second: int) -> bool:
+    """检查视频在指定时间点是否有可读取的帧"""
+    import cv2
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.warning(f"无法打开视频文件: {video_path}")
+            return False
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            logger.warning(f"无法获取视频帧率: {video_path}")
+            return False
+
+        # 设置到指定时间点
+        frame_pos = int(time_second * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+
+        # 尝试读取帧
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret:
+            logger.warning(f"无法读取视频在 {time_second} 秒处的帧: {video_path}")
+            return False
+
+        return True
+    except Exception as e:
+        logger.error(f"检查视频帧时出错: {video_path}, 时间点: {time_second}秒, 错误: {e}")
+        try:
+            cap.release()
+        except:
+            pass
+        return False
+
+
+def is_video_corrupt(video_path: str) -> bool:
+    """综合检测视频文件是否损坏"""
+    try:
+        # 第一层检查：文件结构检查
+        if not check_video_file_structure(video_path):
+            logger.warning(f"视频文件结构检查失败: {video_path}")
+            return True
+
+        # 第二层检查：关键时间点帧检查
+        # 检查开始、15秒处、30秒处的帧
+        key_points = [0, 15, 30]
+
+        # 获取视频时长，避免检查超出视频长度的点
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = frame_count / fps if fps > 0 else 0
+            cap.release()
+
+            # 过滤掉超出视频长度的时间点
+            key_points = [t for t in key_points if t < duration]
+
+            # 确保至少检查视频结束前的帧
+            if duration > 5 and int(duration) - 3 not in key_points:
+                key_points.append(int(duration) - 3)
+
+        for time_point in key_points:
+            if not check_frame_at_time(video_path, time_point):
+                logger.warning(f"视频在 {time_point} 秒处损坏: {video_path}")
+                return True
+
+        logger.info(f"视频完整性检查通过: {video_path}")
+        return False
+    except Exception as e:
+        logger.error(f"视频完整性检查出错: {video_path}, 错误: {e}")
+        return True
+
+
 def extract_audio(video_path: str, audio_path: str) -> bool:
-    """从视频文件中提取音频，使用改进的进度记录器"""
+    """从视频文件中提取音频，先检查视频完整性"""
     video = None
     try:
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
         logger.info(f"开始从视频提取音频: {video_path} -> {audio_path}")
+
+        # 先检查视频是否损坏
+        if is_video_corrupt(video_path):
+            logger.error(f"视频文件损坏，无法提取音频: {video_path}")
+            return False
 
         # 创建并配置进度记录器
         progress_logger = MoviePyProgressLogger(logger)
@@ -177,20 +294,58 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
         if video.audio is None:
             logger.error(f"视频文件中没有音频: {video_path}")
             return False
-        video.audio.write_audiofile(
-            audio_path,
-            logger=progress_logger,
-            verbose=False  # 关闭MoviePy的内置进度输出
-        )
 
-        logger.info(f"音频提取完成: {audio_path}")
-        return True
+        # 设置超时机制
+        import threading
+        import time
+
+        def extract_with_timeout():
+            nonlocal video, audio_path, progress_logger
+            try:
+                video.audio.write_audiofile(
+                    audio_path,
+                    logger=progress_logger,
+                    verbose=False,  # 关闭MoviePy的内置进度输出
+                    bitrate="128k"  # 降低比特率加快处理
+                )
+                return True
+            except Exception as e:
+                logger.error(f"音频提取过程中出错: {e}")
+                return False
+
+        # 创建并启动提取线程
+        extract_thread = threading.Thread(target=extract_with_timeout)
+        extract_thread.daemon = True
+        extract_thread.start()
+
+        # 设置超时时间（秒）- 根据文件大小调整
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        timeout = max(300, int(file_size_mb * 0.5))  # 最少5分钟，每MB多0.5秒
+
+        # 等待提取完成或超时
+        start_time = time.time()
+        while extract_thread.is_alive() and time.time() - start_time < timeout:
+            time.sleep(1)
+
+        if extract_thread.is_alive():
+            logger.error(f"音频提取超时 ({timeout}秒): {video_path}")
+            return False
+
+        # 检查音频文件是否生成
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            logger.info(f"音频提取完成: {audio_path}")
+            return True
+        else:
+            logger.error(f"未能成功生成音频文件: {audio_path}")
+            return False
+
     except Exception as e:
         logger.error(f"从 {video_path} 提取音频时出错: {e}", exc_info=True)
         return False
     finally:
         try:
-            video.close()
+            if video is not None:
+                video.close()
         except:
             pass
 
@@ -379,6 +534,14 @@ def process_video(video_path: str) -> None:
         logger.error(f"文件未准备好，跳过处理: {video_path}")
         total_videos_skipped += 1
         print_statistics()  # 每次跳过视频时打印统计信息
+        return
+
+    # 检查视频是否损坏
+    if is_video_corrupt(video_path):
+        logger.error(f"视频文件损坏，跳过处理: {video_path}")
+        update_db(video_path, None)  # 标记为已处理但失败
+        total_videos_skipped += 1
+        print_statistics()
         return
 
     # 提取音频
