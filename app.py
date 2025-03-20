@@ -256,31 +256,54 @@ def is_video_corrupt(video_path: str) -> bool:
             is_hevc = codec.lower() in ['hevc', 'hvc1', 'h265']
             # HEVC编码只允许1帧损坏，其他编码允许2帧损坏
             max_failed_frames = 1 if is_hevc else 2
-            logger.info(f"视频编码为{'HEVC' if is_hevc else codec}，允许最大损坏帧数: {max_failed_frames}")
 
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             duration = frame_count / fps if fps > 0 else 0
+            
+            # 根据视频时长动态调整检查点
+            if duration <= 60:  # 1分钟以内的视频
+                key_points = [0, int(duration/2), int(duration-3)]
+            elif duration <= 300:  # 5分钟以内的视频
+                key_points = [0, 15, int(duration-3)]
+            else:  # 长视频
+                # 每5分钟检查一个点，但最多检查6个点
+                interval = min(300, int(duration/6))
+                key_points = [0]  # 起始点
+                current = interval
+                while current < duration and len(key_points) < 5:
+                    key_points.append(int(current))
+                    current += interval
+                key_points.append(int(duration-3))  # 结束点
+                
+            logger.info(f"视频长度: {int(duration)}秒, 检查点: {key_points}")
             cap.release()
-
-            # 检查关键时间点
-            key_points = [0, 15, 30]
-            key_points = [t for t in key_points if t < duration]
-            if duration > 5 and int(duration) - 3 not in key_points:
-                key_points.append(int(duration) - 3)
 
             failed_points = 0
             first_failed_point = None
             
-            for time_point in key_points:
-                if not check_frame_at_time(video_path, time_point):
-                    failed_points += 1
-                    if first_failed_point is None:
-                        first_failed_point = time_point
-                        logger.warning(f"视频在 {time_point} 秒处损坏: {video_path}")
-                    if failed_points > max_failed_frames:
-                        logger.error(f"视频有超过{max_failed_frames}个时间点损坏，从 {first_failed_point} 秒开始出现问题: {video_path}")
-                        return True
+            # 使用线程池并行检查多个时间点
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                # 创建所有检查任务
+                future_to_time = {executor.submit(check_frame_at_time, video_path, t): t 
+                                for t in key_points}
+                
+                # 获取结果
+                for future in concurrent.futures.as_completed(future_to_time):
+                    time_point = future_to_time[future]
+                    try:
+                        if not future.result():
+                            failed_points += 1
+                            if first_failed_point is None:
+                                first_failed_point = time_point
+                                logger.warning(f"视频在 {time_point} 秒处损坏: {video_path}")
+                            if failed_points > max_failed_frames:
+                                logger.error(f"视频有超过{max_failed_frames}个时间点损坏，从 {first_failed_point} 秒开始出现问题: {video_path}")
+                                return True
+                    except Exception as e:
+                        logger.error(f"检查时间点 {time_point} 时出错: {e}")
+                        failed_points += 1
 
             logger.info(f"视频完整性检查通过: {video_path}")
             return False
@@ -608,7 +631,7 @@ def process_video(video_path: str) -> None:
         logger.info(f"成功生成SRT: {srt_path}")
         total_videos_processed += 1
     else:
-        update_db(video_path, None)
+        update_db(video_path, '生成SRT失败')
         total_videos_skipped += 1
         logger.error(f"为 {video_path} 生成SRT失败")
 
