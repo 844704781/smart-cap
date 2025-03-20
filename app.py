@@ -240,33 +240,46 @@ def is_video_corrupt(video_path: str) -> bool:
             logger.warning(f"视频文件结构检查失败: {video_path}")
             return True
 
-        # 第二层检查：关键时间点帧检查
-        # 检查开始、15秒处、30秒处的帧
-        key_points = [0, 15, 30]
-
-        # 获取视频时长，避免检查超出视频长度的点
+        # 获取视频编解码器信息
         import cv2
         cap = cv2.VideoCapture(video_path)
         if cap.isOpened():
+            fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+            codec = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)])
+            logger.info(f"视频编解码器: {codec}")
+            
+            # 判断是否为HEVC编码
+            is_hevc = codec.lower() in ['hevc', 'hvc1', 'h265']
+            # HEVC编码只允许1帧损坏，其他编码允许2帧损坏
+            max_failed_frames = 1 if is_hevc else 2
+            logger.info(f"视频编码为{'HEVC' if is_hevc else codec}，允许最大损坏帧数: {max_failed_frames}")
+
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             duration = frame_count / fps if fps > 0 else 0
             cap.release()
 
-            # 过滤掉超出视频长度的时间点
+            # 检查关键时间点
+            key_points = [0, 15, 30]
             key_points = [t for t in key_points if t < duration]
-
-            # 确保至少检查视频结束前的帧
             if duration > 5 and int(duration) - 3 not in key_points:
                 key_points.append(int(duration) - 3)
 
-        for time_point in key_points:
-            if not check_frame_at_time(video_path, time_point):
-                logger.warning(f"视频在 {time_point} 秒处损坏: {video_path}")
-                return True
+            failed_points = 0
+            first_failed_point = None
+            
+            for time_point in key_points:
+                if not check_frame_at_time(video_path, time_point):
+                    failed_points += 1
+                    if first_failed_point is None:
+                        first_failed_point = time_point
+                        logger.warning(f"视频在 {time_point} 秒处损坏: {video_path}")
+                    if failed_points > max_failed_frames:
+                        logger.error(f"视频有超过{max_failed_frames}个时间点损坏，从 {first_failed_point} 秒开始出现问题: {video_path}")
+                        return True
 
-        logger.info(f"视频完整性检查通过: {video_path}")
-        return False
+            logger.info(f"视频完整性检查通过: {video_path}")
+            return False
     except Exception as e:
         logger.error(f"视频完整性检查出错: {video_path}, 错误: {e}")
         return True
@@ -279,11 +292,6 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
         logger.info(f"开始从视频提取音频: {video_path} -> {audio_path}")
-
-        # 先检查视频是否损坏
-        if is_video_corrupt(video_path):
-            logger.error(f"视频文件损坏，无法提取音频: {video_path}")
-            return False
 
         # 创建并配置进度记录器
         progress_logger = MoviePyProgressLogger(logger)

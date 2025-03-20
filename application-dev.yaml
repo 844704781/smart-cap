@@ -1,7 +1,7 @@
 # 开发环境配置
 paths:
   # 开发环境源视频目录
-  source_dir: C:\Users\watermelon\Downloads\videos\许你良辰岁岁安【24集】-671921098168312
+  source_dir: C:\Users\watermelon\Downloads\test
   # 开发环境字幕输出目录
-  target_dir: C:\Users\watermelon\Downloads\videos\许你良辰岁岁安【24集】-671921098168312\videos_subtitles\data
-  cache_dir: C:\Users\watermelon\Downloads\videos\许你良辰岁岁安【24集】-671921098168312\videos_subtitles\.cache
+  target_dir: C:\Users\watermelon\Downloads\test\data
+  cache_dir: C:\Users\watermelon\Downloads\test\.cache
