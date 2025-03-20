@@ -239,6 +239,12 @@ def check_frame_at_time(video_path: str, time_second: int) -> bool:
 def is_video_corrupt(video_path: str) -> bool:
     """综合检测视频文件是否损坏"""
     try:
+        # 检查文件大小是否超过2GB
+        file_size = os.path.getsize(video_path)
+        if file_size > 2 * 1024 * 1024 * 1024:  # 2GB = 2 * 1024MB
+            logger.warning(f"视频文件大小超过2GB: {video_path}, 大小: {file_size / (1024*1024*1024):.2f}GB")
+            return True
+
         # 第一层检查：文件结构检查
         if not check_video_file_structure(video_path):
             logger.warning(f"视频文件结构检查失败: {video_path}")
@@ -284,7 +290,7 @@ def is_video_corrupt(video_path: str) -> bool:
             
             # 使用线程池并行检查多个时间点
             import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 # 创建所有检查任务
                 future_to_time = {executor.submit(check_frame_at_time, video_path, t): t 
                                 for t in key_points}
@@ -613,14 +619,14 @@ def process_video(video_path: str) -> None:
     # 检查视频是否损坏
     if is_video_corrupt(video_path):
         logger.error(f"视频文件损坏，跳过处理: {video_path}")
-        update_db(video_path, None)  # 标记为已处理但失败
+        update_db(video_path, '视频文件损坏')  # 改为具体的失败原因
         total_videos_skipped += 1
         print_statistics()
         return
 
     # 提取音频
     if not extract_audio(video_path, audio_path):
-        update_db(video_path, None)
+        update_db(video_path, '音频提取失败')  # 改为具体的失败原因
         total_videos_skipped += 1
         print_statistics()  # 每次跳过视频时打印统计信息
         return
@@ -631,7 +637,7 @@ def process_video(video_path: str) -> None:
         logger.info(f"成功生成SRT: {srt_path}")
         total_videos_processed += 1
     else:
-        update_db(video_path, '生成SRT失败')
+        update_db(video_path, '生成SRT失败')  # 这个已经是具体原因了
         total_videos_skipped += 1
         logger.error(f"为 {video_path} 生成SRT失败")
 
