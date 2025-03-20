@@ -292,6 +292,9 @@ def extract_audio(video_path: str, audio_path: str) -> bool:
         os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
         logger.info(f"开始从视频提取音频: {video_path} -> {audio_path}")
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+            logger.info(f"音频文件已存在: {audio_path}")
+            return True
 
         # 创建并配置进度记录器
         progress_logger = MoviePyProgressLogger(logger)
@@ -374,13 +377,25 @@ def generate_srt(audio_path: str, srt_path: str) -> bool:
 
 
 def is_processed(video_path: str) -> bool:
-    """检查视频是否已经处理过。"""
+    """检查视频是否已经处理过且成功生成了SRT文件。"""
     try:
         if not os.path.exists(DB_PATH):
             return False
+            
         with open(DB_PATH, 'r', encoding='utf-8') as f:
             db = json.load(f)
-            return video_path in db
+            # 检查视频是否在数据库中且有对应的srt文件
+            if video_path in db:
+                video_info = db[video_path]
+                srt_path = video_info.get('srt_path')
+                if srt_path:
+                    logger.info(f"视频已处理且生成了SRT文件: {video_path}")
+                    return True
+                else:
+                    logger.info(f"视频之前处理失败，需要重新处理: {video_path}")
+                    return False
+            return False
+            
     except Exception as e:
         logger.error(f"读取数据库文件失败: {e}")
         return False
