@@ -30,6 +30,10 @@ total_videos_skipped = 0  # 当前任务执行时跳过的视频数
 new_videos_detected = 0  # 新检测到的视频数
 pending_videos = 0  # 待处理的视频数
 
+# 在文件开头添加全局变量
+_db_cache = None
+_db_cache_timestamp = 0
+
 logger = logging.getLogger(__name__)
 
 
@@ -376,52 +380,40 @@ def generate_srt(audio_path: str, srt_path: str) -> bool:
         return False
 
 
-def is_processed(video_path: str) -> bool:
-    """检查视频是否已经处理过且成功生成了SRT文件。"""
+def _load_db_cache() -> dict:
+    """加载数据库到内存缓存"""
+    global _db_cache, _db_cache_timestamp
+    
     try:
         if not os.path.exists(DB_PATH):
-            return False
-            
+            _db_cache = {}
+            return _db_cache
+
+        # 获取文件最后修改时间
+        current_timestamp = os.path.getmtime(DB_PATH)
+        
+        # 如果缓存存在且文件未被修改，直接返回缓存
+        if _db_cache is not None and current_timestamp == _db_cache_timestamp:
+            return _db_cache
+
+        # 重新加载文件
         with open(DB_PATH, 'r', encoding='utf-8') as f:
-            db = json.load(f)
-            # 检查视频是否在数据库中且有对应的srt文件
-            if video_path in db:
-                video_info = db[video_path]
-                srt_path = video_info.get('srt_path')
-                if srt_path:
-                    logger.info(f"视频已处理且生成了SRT文件: {video_path}")
-                    return True
-                else:
-                    logger.info(f"视频之前处理失败，需要重新处理: {video_path}")
-                    return False
-            return False
+            _db_cache = json.load(f)
+            _db_cache_timestamp = current_timestamp
+            return _db_cache
             
     except Exception as e:
         logger.error(f"读取数据库文件失败: {e}")
-        return False
-
-
-def get_all_processed_videos() -> List[str]:
-    """获取所有已处理的视频列表"""
-    try:
-        if not os.path.exists(DB_PATH):
-            return []
-        with open(DB_PATH, 'r', encoding='utf-8') as f:
-            db = json.load(f)
-            return list(db.keys())
-    except Exception as e:
-        logger.error(f"读取数据库文件失败: {e}")
-        return []
+        return {}
 
 
 def update_db(video_path: str, srt_path: Optional[str] = None) -> None:
     """更新数据库的处理信息。"""
+    global _db_cache, _db_cache_timestamp
+    
     try:
-        # 读取现有数据
-        db = {}
-        if os.path.exists(DB_PATH):
-            with open(DB_PATH, 'r', encoding='utf-8') as f:
-                db = json.load(f)
+        # 获取现有数据
+        db = _load_db_cache()
 
         # 更新数据
         db[video_path] = {
@@ -432,8 +424,44 @@ def update_db(video_path: str, srt_path: Optional[str] = None) -> None:
         # 写入更新后的数据
         with open(DB_PATH, 'w', encoding='utf-8') as f:
             json.dump(db, f, ensure_ascii=False, indent=2)
+            
+        # 直接更新缓存和时间戳
+        _db_cache = db
+        _db_cache_timestamp = os.path.getmtime(DB_PATH)
+        
     except Exception as e:
         logger.error(f"更新数据库文件失败: {e}")
+        # 发生错误时清空缓存，强制下次重新加载
+        _db_cache = None
+        _db_cache_timestamp = 0
+
+
+def is_processed(video_path: str) -> bool:
+    """检查视频是否已经处理过且成功生成了SRT文件。"""
+    try:
+        db = _load_db_cache()
+        if video_path in db:
+            video_info = db[video_path]
+            srt_path = video_info.get('srt_path')
+            if srt_path:
+                return True
+            else:
+                logger.info(f"视频之前处理失败，需要重新处理: {video_path}")
+                return False
+        return False
+    except Exception as e:
+        logger.error(f"检查处理状态失败: {e}")
+        return False
+
+
+def get_all_processed_videos() -> List[str]:
+    """获取所有已处理的视频列表"""
+    try:
+        db = _load_db_cache()
+        return list(db.keys())
+    except Exception as e:
+        logger.error(f"获取已处理视频列表失败: {e}")
+        return []
 
 
 def is_file_ready(file_path: str, timeout: int = 60, check_interval: float = 1.0) -> bool:
@@ -579,17 +607,17 @@ def process_video(video_path: str) -> None:
         update_db(video_path, srt_path)
         logger.info(f"成功生成SRT: {srt_path}")
         total_videos_processed += 1
-
-        # 删除音频文件以节省空间
-        try:
-            os.remove(audio_path)
-            logger.info(f"已删除临时音频文件: {audio_path}")
-        except Exception as e:
-            logger.warning(f"删除音频文件 {audio_path} 时出错: {e}")
     else:
         update_db(video_path, None)
         total_videos_skipped += 1
         logger.error(f"为 {video_path} 生成SRT失败")
+
+    # 删除音频文件以节省空间
+    try:
+        os.remove(audio_path)
+        logger.info(f"已删除临时音频文件: {audio_path}")
+    except Exception as e:
+        logger.warning(f"删除音频文件 {audio_path} 时出错: {e}")
 
     print_statistics()  # 每次处理完视频时打印统计信息
 
